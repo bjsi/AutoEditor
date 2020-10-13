@@ -29,6 +29,7 @@ namespace AutoEditor.Editor
         {
             ffmpeg.ThrowIfMissing("Path to FFMPEG does not exist");
             videoFile.ThrowIfMissing("Path to input file does not exist");
+            ffprobe.ThrowIfMissing("Path to ffprobe does not exist");
         }
 
         private async Task<BufferedCommandResult> ExecuteFfprobeCommandAsync(IEnumerable<string> args)
@@ -43,7 +44,7 @@ namespace AutoEditor.Editor
         {
             return await CliWrap.Cli
                 .Wrap(_ffmpegPath.FullName)
-                .WithArguments(args)
+                .WithArguments(args, false)
                 .ExecuteBufferedAsync();
         }
 
@@ -54,6 +55,7 @@ namespace AutoEditor.Editor
                 var args = new string[]
                 {
                     "-show_streams",
+                    "-of", "json",
                     videoFile.FullName
                 };
 
@@ -65,45 +67,54 @@ namespace AutoEditor.Editor
             catch (CommandExecutionException ex)
             {
                 Console.WriteLine("Failed to get audio sampling rate info because the call to ffmpeg failed.");
+                return -1;
             }
         }
 
         private List<FFprobeStream> ParseFfmpegSamplingRate(string input)
         {
-            return input?.Deserialize<List<FFprobeStream>>();
+            return input?.Deserialize<RootFfprobeObject>().Streams;
         }
 
         /// <summary>
         /// https://superuser.com/questions/1183663/determining-audio-level-peaks-with-ffmpeg
         /// </summary>
         /// <returns></returns>
-        private async Task<Dictionary<double, double>> GetAudioLoudnessInfo()
+        public async Task<List<LoudnessInfo>> GetAudioLoudnessInfo()
         {
+            var tmp = DateTime.Now.Ticks + "ffmpeg.tmp";
+
             try
             {
+                // Samples the loudness roughly every 1 second
                 var reset = await GetAudioSamplingRate() / 1000;
-
-                var file = Path.GetTempFileName();
 
                 var args = new string[]
                 {
-                    $"-i {videoFile.FullName} ",
-                    $"-af astats=metadata=1:reset={reset},ametadata=print:key=lavfi.astats.Overall.RMS_level:file={file} -f null ",
-                    "-f null -"
+                    "-i", $"{videoFile.FullName}",
+                    "-af", $"astats=metadata=1:reset={reset},ametadata=print:key=lavfi.astats.Overall.RMS_level:file={tmp}",
+                    "-f", "null",
+                    "-"
                 };
 
                 var info = await ExecuteFfmpegCommandAsync(args);
-                var lines = await File.ReadAllLinesAsync(file);
+                var lines = await File.ReadAllLinesAsync(tmp);
                 return ParseFfmpegLoudnessInfo(lines);
 
             }
             catch (CommandExecutionException e)
             {
                 Console.WriteLine("Failed to get audio loudness info because the call to ffmpeg failed.");
+                return null;
             }
             catch (IOException e)
             {
                 Console.WriteLine("Failed to get audio loudness info because the call to ffmpeg failed.");
+                return null;
+            }
+            finally
+            {
+                File.Delete(tmp);
             }
         }
 
@@ -112,20 +123,51 @@ namespace AutoEditor.Editor
         /// </summary>
         /// <param name="input"></param>
         /// <returns></returns>
-        private Dictionary<double, double> ParseFfmpegLoudnessInfo(string[] input)
+        private List<LoudnessInfo> ParseFfmpegLoudnessInfo(string[] input)
         {
-            var ret = new Dictionary<double, double>();
+            var ret = new List<LoudnessInfo>();
             if (input.Length < 2 || input.Length % 2 != 0) 
             {
                 throw new InvalidDataException("Unexpected input to ParseFfmpegLoudnessInfo");
             }
 
-            for (int i = 0; i < input.Length; i += 2)
+            for (int i = 1; i < input.Length; i += 2)
             {
                 var firstLine = input[i - 1];
-                var secondLine = input[i - 2]
+                var secondLine = input[i];
+                ret.Add(DeserializeLoudnessInfo(firstLine, secondLine));
             }
             return ret;
+        }
+
+        private LoudnessInfo DeserializeLoudnessInfo(string firstLine, string secondLine)
+        {
+            var info = new LoudnessInfo();
+
+            var firstSplit = firstLine
+                .Split(' ')
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .ToList();
+
+            var frame = int.Parse(firstSplit[0].Split(':').Last());
+            var pts = double.Parse(firstSplit[1].Split(':').Last());
+            var ptsTime = double.Parse(firstSplit[2].Split(':').Last());
+
+            var secondSplit = secondLine
+                .Split('=')
+                .Last();
+
+            var level = secondSplit == "-inf"
+                ? double.MinValue
+                : double.Parse(secondSplit);
+
+            return new LoudnessInfo
+            {
+                Frame = frame,
+                Pts = pts,
+                PtsTime = ptsTime,
+                Level = level
+            };
         }
     }
 }

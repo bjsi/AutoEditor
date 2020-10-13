@@ -41,4 +41,9 @@ namespace AutoEditor.Models
         public string bit_rate { get; set; }
         public Disposition disposition { get; set; }
     }
+
+    public class RootFfprobeObject
+    {
+        public List<FFprobeStream> Streams { get; set; }
+    }
 }
